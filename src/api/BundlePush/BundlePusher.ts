@@ -16,6 +16,7 @@ import { List, ZosmfSession, SshSession, Shell, Upload, IUploadOptions, ZosFiles
 import { getResource, IResourceParms } from "@zowe/cics";
 import { BundleDeployer } from "../BundleDeploy/BundleDeployer";
 import { Bundle } from "../BundleContent/Bundle";
+import { SubtaskWithStatus } from "./SubtaskWithStatus";
 
 
 /**
@@ -129,7 +130,7 @@ export class BundlePusher {
     await this.runAllNpmInstalls(sshSession, packageJsonFiles);
 
     // Run DFHDPLOY to install the bundle
-    await this.deployBundle(zosMFSession, bd, cicsSession);
+    await this.deployBundle(zosMFSession, bd, cicsSession, bundle);
 
     // Complete the progress bar
     this.progressBar.percentComplete = TaskProgress.ONE_HUNDRED_PERCENT;
@@ -216,7 +217,7 @@ export class BundlePusher {
       this.issueWarning("ssh profile --host value '" + sshProfile.host + "' does not match zosmf value '" + zosmfProfile.host + "'.");
     }
     // Do the required profiles share the same user name?
-    if (zosmfProfile.user !== sshProfile.user) {
+    if (zosmfProfile.user.toUpperCase() !== sshProfile.user.toUpperCase()) {
       this.issueWarning("ssh profile --user value '" + sshProfile.user + "' does not match zosmf value '" + zosmfProfile.user + "'.");
     }
 
@@ -225,12 +226,12 @@ export class BundlePusher {
       if (zosmfProfile.host !== cicsProfile.host) {
         this.issueWarning("cics profile --host value '" + cicsProfile.host + "' does not match zosmf value '" + zosmfProfile.host + "'.");
       }
-      if (zosmfProfile.user !== cicsProfile.user) {
+      if (zosmfProfile.user.toUpperCase() !== cicsProfile.user.toUpperCase()) {
         this.issueWarning("cics profile --user value '" + cicsProfile.user + "' does not match zosmf value '" + zosmfProfile.user + "'.");
       }
 
       // Do the cics-plexes match?
-      if (this.params.arguments.cicsplex !== cicsProfile.cicsPlex) {
+      if (cicsProfile.cicsPlex !== undefined && this.params.arguments.cicsplex !== cicsProfile.cicsPlex) {
         this.issueWarning("cics profile --cics-plex value '" + cicsProfile.cicsPlex +
           "' does not match --cicsplex value '" + this.params.arguments.cicsplex + "'.");
       }
@@ -327,11 +328,11 @@ export class BundlePusher {
   private async undeployExistingBundle(zosMFSession: AbstractSession, bd: BundleDeployer) {
     // End the current progress bar so that UNDEPLOY can create its own
     this.updateStatus("Undeploying bundle '" + this.params.arguments.name + "' from CICS");
-    this.endProgressBar();
 
     const targetstateLocal = this.params.arguments.targetstate;
     this.params.arguments.targetstate = "DISCARDED";
-    await bd.undeployBundle(zosMFSession);
+    const subtask = new SubtaskWithStatus(this.progressBar, TaskProgress.THIRTY_PERCENT);
+    await bd.undeployBundle(zosMFSession, subtask);
     this.params.arguments.targetstate = targetstateLocal;
 
     // Resume the current progress bar
@@ -340,15 +341,15 @@ export class BundlePusher {
     this.startProgressBar();
   }
 
-  private async deployBundle(zosMFSession: AbstractSession, bd: BundleDeployer, cicsSession: AbstractSession) {
+  private async deployBundle(zosMFSession: AbstractSession, bd: BundleDeployer, cicsSession: AbstractSession, bundle: Bundle) {
     // End the current progress bar so that DEPLOY can create its own
     this.updateStatus("Deploying bundle '" + this.params.arguments.name + "' to CICS");
-    this.endProgressBar();
+    const subtask = new SubtaskWithStatus(this.progressBar, TaskProgress.THIRTY_PERCENT);
 
     let deployError: Error;
     let dfhdployOutput = "";
     try {
-      await bd.deployBundle(zosMFSession);
+      await bd.deployBundle(zosMFSession, subtask);
     }
     catch (error) {
       // temporarily ignore the error as we might want to generate additional resource
@@ -369,9 +370,9 @@ export class BundlePusher {
 
     // Collect general information about the regions in the CICSplex scope
     const diagnosticsWorking = await this.outputGeneralDiagnostics(cicsSession);
-    if (diagnosticsWorking) {
+    if (diagnosticsWorking && bundle.containsDefinitionsOfType("http://www.ibm.com/xmlns/prod/cics/bundle/NODEJSAPP")) {
       // Generate additional diagnostic output for Node.js
-      await this.outputNodejsSpecificDiagnostics(cicsSession, dfhdployOutput);
+      await this.outputNodejsSpecificDiagnostics(cicsSession);
     }
 
     // Now rethrow the original error, if there was one.
@@ -520,6 +521,7 @@ export class BundlePusher {
 
     const uploadOptions: IUploadOptions = { recursive: true };
     uploadOptions.attributes = this.findZosAttributes();
+    uploadOptions.task = new SubtaskWithStatus(this.progressBar, TaskProgress.TEN_PERCENT);
 
     try {
       await Upload.dirToUSSDirRecursive(zosMFSession, this.localDirectory, this.params.arguments.bundledir, uploadOptions);
@@ -548,10 +550,9 @@ export class BundlePusher {
     return new ZosFilesAttributes(Bundle.getTemplateZosAttributesFile());
   }
 
-  private updateStatus(status: string) {
-    const PERCENT5 = 5;
+  private updateStatus(status: string, percentageIncrease = 3) {
     const MAX_PROGRESS_BAR_MESSAGE = 60;
-    this.progressBar.percentComplete += PERCENT5;
+    this.progressBar.percentComplete += percentageIncrease;
 
     if (status.length > MAX_PROGRESS_BAR_MESSAGE)
     {
@@ -635,32 +636,29 @@ export class BundlePusher {
     return scopeFound;
   }
 
-  private async outputNodejsSpecificDiagnostics(cicsSession: AbstractSession, dfhdployOutput: string) {
-    // Did the Bundle contents include a NODEJSAPP?
-    if (dfhdployOutput.indexOf("http://www.ibm.com/xmlns/prod/cics/bundle/NODEJSAPP") > -1) {
-      let diagnosticsIssued = false;
-      try {
-        // Attempt to gather additional Node.js specific information from CICS
-        this.updateStatus("Gathering Node.js diagnostics");
-        diagnosticsIssued = await this.gatherNodejsDiagnosticsFromCics(cicsSession);
+  private async outputNodejsSpecificDiagnostics(cicsSession: AbstractSession) {
+    let diagnosticsIssued = false;
+    try {
+      // Attempt to gather additional Node.js specific information from CICS
+      this.updateStatus("Gathering Node.js diagnostics");
+      diagnosticsIssued = await this.gatherNodejsDiagnosticsFromCics(cicsSession);
+    }
+    catch (diagnosticsError) {
+      // Something went wrong generating diagnostic info. Don't trouble the user
+      // with what might be an exotic error message (e.g. hex dump of an entire HTML page),
+      // just log the failure.
+      if (this.params.arguments.silent === undefined) {
+        const logger = Logger.getAppLogger();
+        logger.debug(diagnosticsError.message);
       }
-      catch (diagnosticsError) {
-        // Something went wrong generating diagnostic info. Don't trouble the user
-        // with what might be an exotic error message (e.g. hex dump of an entire HTML page),
-        // just log the failure.
-        if (this.params.arguments.silent === undefined) {
-          const logger = Logger.getAppLogger();
-          logger.debug(diagnosticsError.message);
-        }
-      }
+    }
 
-      // We must have a cics profile in order to have got this far, so suggest a command that can be run to figure out more.
-      if (diagnosticsIssued === false) {
-        const msg = "For further information on the state of your NODEJSAPP resources, consider running the following command:\n\n" +
-              "zowe cics get resource CICSNodejsapp --region-name " + this.params.arguments.scope +
-              " --criteria \"BUNDLE=" + this.params.arguments.name + "\" --cics-plex " + this.params.arguments.cicsplex + "\n";
-        this.issueMessage(msg);
-      }
+    // We must have a cics profile in order to have got this far, so suggest a command that can be run to figure out more.
+    if (diagnosticsIssued === false) {
+      const msg = "For further information on the state of your NODEJSAPP resources, consider running the following command:\n\n" +
+            "zowe cics get resource CICSNodejsapp --region-name " + this.params.arguments.scope +
+            " --criteria \"BUNDLE=" + this.params.arguments.name + "\" --cics-plex " + this.params.arguments.cicsplex + "\n";
+      this.issueMessage(msg);
     }
   }
 
