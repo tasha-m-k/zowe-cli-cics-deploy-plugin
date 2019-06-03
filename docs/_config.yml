@@ -7,7 +7,7 @@ output: web
 topnav_title: Zowe CLI CICS deploy plugin
 # this appears on the top navigation bar next to the home button
 
-site_title: CICS deploy plugin
+site_title: Zowe CLI CICS deploy plugin
 # this appears in the html browser tab for the site title (seen mostly by search engines, not users)
 
 company_name: IBM
